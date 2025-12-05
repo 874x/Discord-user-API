@@ -5,9 +5,6 @@ import fs from "fs";
 const app = express();
 app.use(express.json());
 
-// Load emojis
-const emojis = JSON.parse(fs.readFileSync("./utils/Emoji.json", "utf8"));
-
 // Discord API fetcher
 async function fetchDiscordUser(userId) {
     const url = `https://discord.com/api/v10/users/${userId}`;
@@ -149,4 +146,5 @@ app.post("/discord", async (req, res) => {
 app.listen(3000, () => {
     console.log("API running on port 3000");
 });
+
 
