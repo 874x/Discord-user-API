@@ -3,11 +3,11 @@ const express = require('express')
 const fetch = require('node-fetch')
 const { Client, GatewayIntentBits } = require('discord.js')
 
-const BOT_TOKEN = process.env.BOT_TOKEN
+const TOKEN = process.env.BOT_TOKEN
 const CACHE_TTL = Number(process.env.CACHE_TTL) || 120
 const KEY_LIST = (process.env.API_KEYS || "").split(",").map(a => a.trim()).filter(a => a.length)
 
-if (!BOT_TOKEN) process.exit(1)
+if (!TOKEN) process.exit(1)
 
 const client = new Client({
   intents: [
@@ -212,4 +212,5 @@ app.get('/v1/user/:id', async (req, res) => {
 })
 
 app.listen(process.env.PORT || 3000)
+
 
