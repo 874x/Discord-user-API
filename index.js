@@ -72,18 +72,18 @@ function getBadges(public_flags) {
     const badgeList = [];
 
     const flags = {
-        1 << 0: "DiscordStaff",
-        1 << 1: "PartneredServerOwner",
-        1 << 2: "HypeSquadEvents",
-        1 << 3: "BugHunterLevel1",
-        1 << 6: "HypeSquadBravery",
-        1 << 7: "HypeSquadBrilliance",
-        1 << 8: "HypeSquadBalance",
-        1 << 9: "EarlySupporter",
-        1 << 14: "BugHunterLevel2",
-        1 << 17: "ActiveDeveloper",
-        1 << 18: "ModeratorProgramsAlumni",
-        1 << 19: "EarlyVerifiedBotDeveloper"
+        [1 << 0]: "DiscordStaff",
+        [1 << 1]: "PartneredServerOwner",
+        [1 << 2]: "HypeSquadEvents",
+        [1 << 3]: "BugHunterLevel1",
+        [1 << 6]: "HypeSquadBravery",
+        [1 << 7]: "HypeSquadBrilliance",
+        [1 << 8]: "HypeSquadBalance",
+        [1 << 9]: "EarlySupporter",
+        [1 << 14]: "BugHunterLevel2",
+        [1 << 17]: "ActiveDeveloper",
+        [1 << 18]: "ModeratorProgramsAlumni",
+        [1 << 19]: "EarlyVerifiedBotDeveloper"
     };
 
     for (const [flag, name] of Object.entries(flags)) {
@@ -149,3 +149,4 @@ app.post("/discord", async (req, res) => {
 app.listen(3000, () => {
     console.log("API running on port 3000");
 });
+
