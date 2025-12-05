@@ -8,19 +8,32 @@ app.use(express.json());
 
 const BOT_TOKEN = process.env.DISCORD_TOKEN;
 
-// ------- Fetch Discord User -------
+// ---------------- Fetch Discord User ----------------
+
 async function fetchDiscordUser(userId) {
-    const res = await fetch(`https://discord.com/api/v10/users/${userId}`, {
+    const response = await fetch(`https://discord.com/api/v10/users/${userId}`, {
         headers: {
             Authorization: `Bot ${BOT_TOKEN}`
         }
     });
 
-    if (res.status === 404) return null;
-    return await res.json();
+    // If Discord returned HTML instead of JSON
+    const contentType = response.headers.get("content-type");
+
+    if (!contentType || !contentType.includes("application/json")) {
+        const html = await response.text();
+        console.error("❌ Discord returned non-JSON response:");
+        console.error(html);
+        return null;
+    }
+
+    if (response.status === 404) return null;
+
+    return await response.json();
 }
 
-// ------- Nitro Detection Logic -------
+// ---------------- Nitro Detection Logic ----------------
+
 function detectNitro(user) {
     const detection_methods = [];
 
@@ -51,7 +64,7 @@ function detectNitro(user) {
         has_nitro,
         nitro_type: has_nitro ? "Nitro" : "None",
         nitro_tier: has_nitro ? "Nitro" : "None",
-        premium_type: 0,
+        premium_type: user.premium_type || 0,
         detection_methods,
         avatar_animated,
         has_avatar_decoration,
@@ -62,7 +75,7 @@ function detectNitro(user) {
     };
 }
 
-// ------------------- ROUTES -------------------
+// ----------------------- ROUTES -----------------------
 
 app.get("/", (req, res) => {
     res.json({
@@ -73,8 +86,10 @@ app.get("/", (req, res) => {
     });
 });
 
+// Nitro Route
 app.get("/api/nitro/:id", async (req, res) => {
     if (!BOT_TOKEN) {
+        console.error("❌ DISCORD_TOKEN is missing!");
         return res.status(500).json({ error: "Missing DISCORD_TOKEN" });
     }
 
@@ -86,7 +101,7 @@ app.get("/api/nitro/:id", async (req, res) => {
 
     const user = await fetchDiscordUser(userId);
     if (!user) {
-        return res.status(404).json({ success: false, error: "User not found" });
+        return res.status(404).json({ success: false, error: "User not found or Discord blocked the request" });
     }
 
     const nitroInfo = detectNitro(user);
@@ -100,13 +115,21 @@ app.get("/api/nitro/:id", async (req, res) => {
     });
 });
 
+// Basic user info
 app.get("/api/user/:id", async (req, res) => {
     const user = await fetchDiscordUser(req.params.id);
-    if (!user) return res.status(404).json({ error: "User not found" });
+
+    if (!user) {
+        return res.status(404).json({ success: false, error: "User not found" });
+    }
 
     res.json({ success: true, user });
 });
 
-// --------------- START SERVER ---------------
+// ------------------- START SERVER ---------------------
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`API running on port ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`API running on port ${PORT}`);
+    console.log("BOT TOKEN LOADED:", BOT_TOKEN ? "YES" : "NO");
+});
