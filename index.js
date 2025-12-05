@@ -1,72 +1,112 @@
-require("dotenv").config();
-const express = require("express");
-const fetch = require("node-fetch");
-const { initializeApp } = require("firebase-admin/app");
-const { getDatabase } = require("firebase-admin/database");
-const admin = require("firebase-admin");
+import express from "express";
+import fetch from "node-fetch";
+import dotenv from "dotenv";
 
-if (!admin.apps.length) {
-  initializeApp({
-    credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_KEY)),
-    databaseURL: process.env.FIREBASE_URL
-  });
-}
-
-const db = getDatabase();
+dotenv.config();
 const app = express();
 app.use(express.json());
 
-/**
- * FAKE USER PROVIDER:
- * This replaces Discord API.
- * You can modify the endpoint to your own data source.
- */
-async function getUserFromYourSource(id) {
-  const url = `https://japi.rest/discord/v1/user/${id}`;
-  const res = await fetch(url);
-  if (!res.ok) return null;
-  return res.json();
-}
+const BOT_TOKEN = process.env.DISCORD_TOKEN;
 
-app.get("/user/:id", async (req, res) => {
-  const id = req.params.id;
-  const ref = db.ref(`users/${id}`);
-
-  try {
-    const snap = await ref.get();
-    let cached = snap.val();
-
-    // Check your API source
-    const fresh = await getUserFromYourSource(id);
-
-    if (!fresh || fresh.error) {
-      return res.status(404).json({ success: false, error: "user_not_found" });
-    }
-
-    // Only rewrite Firebase if:
-    // - not cached
-    // - badges updated
-    // - username changed
-    // - avatar changed etc.
-    if (!cached || JSON.stringify(cached) !== JSON.stringify(fresh)) {
-      await ref.set(fresh);
-    }
-
-    res.json({
-      success: true,
-      cached: !!cached,
-      data: fresh
+// ------- Fetch Discord User -------
+async function fetchDiscordUser(userId) {
+    const res = await fetch(`https://discord.com/api/v10/users/${userId}`, {
+        headers: {
+            Authorization: `Bot ${BOT_TOKEN}`
+        }
     });
 
-  } catch (e) {
-    console.log("ERROR:", e);
-    res.status(500).json({ success: false, error: "internal_error" });
-  }
-});
+    if (res.status === 404) return null;
+    return await res.json();
+}
+
+// ------- Nitro Detection Logic -------
+function detectNitro(user) {
+    const detection_methods = [];
+
+    const has_avatar_decoration = !!user.avatar_decoration_data;
+    const has_collectibles = !!user.user_profile?.collectibles;
+    const has_display_styles = !!user.user_profile?.bio_styles;
+    const has_clan = !!user.clan;
+    const has_banner = !!user.banner;
+
+    const avatar_hash = user.avatar;
+    const avatar_animated = avatar_hash ? avatar_hash.startsWith("a_") : false;
+
+    if (has_avatar_decoration) detection_methods.push("avatar_decoration");
+    if (has_collectibles) detection_methods.push("collectibles");
+    if (has_display_styles) detection_methods.push("display_name_styles");
+    if (has_clan) detection_methods.push("clan_badge");
+    if (avatar_animated) detection_methods.push("animated_avatar");
+
+    const has_nitro =
+        has_avatar_decoration ||
+        has_collectibles ||
+        has_display_styles ||
+        has_clan ||
+        has_banner ||
+        avatar_animated;
+
+    return {
+        has_nitro,
+        nitro_type: has_nitro ? "Nitro" : "None",
+        nitro_tier: has_nitro ? "Nitro" : "None",
+        premium_type: 0,
+        detection_methods,
+        avatar_animated,
+        has_avatar_decoration,
+        has_collectibles,
+        has_display_styles,
+        has_clan,
+        has_banner
+    };
+}
+
+// ------------------- ROUTES -------------------
 
 app.get("/", (req, res) => {
-  res.send("Discord User API is running ✔");
+    res.json({
+        status: "online",
+        name: "JS Discord Nitro Detection API",
+        version: "1.0.0",
+        endpoints: ["/api/nitro/:id", "/api/user/:id"]
+    });
 });
 
+app.get("/api/nitro/:id", async (req, res) => {
+    if (!BOT_TOKEN) {
+        return res.status(500).json({ error: "Missing DISCORD_TOKEN" });
+    }
+
+    const userId = req.params.id;
+
+    if (!/^\d+$/.test(userId)) {
+        return res.status(400).json({ error: "Invalid user ID" });
+    }
+
+    const user = await fetchDiscordUser(userId);
+    if (!user) {
+        return res.status(404).json({ success: false, error: "User not found" });
+    }
+
+    const nitroInfo = detectNitro(user);
+
+    res.json({
+        success: true,
+        user_id: userId,
+        username: user.username,
+        global_name: user.global_name,
+        ...nitroInfo
+    });
+});
+
+app.get("/api/user/:id", async (req, res) => {
+    const user = await fetchDiscordUser(req.params.id);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    res.json({ success: true, user });
+});
+
+// --------------- START SERVER ---------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API running on port ${PORT}`));
