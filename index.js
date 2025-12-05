@@ -1,112 +1,151 @@
 import express from "express";
 import fetch from "node-fetch";
-import dotenv from "dotenv";
+import fs from "fs";
 
-dotenv.config();
 const app = express();
 app.use(express.json());
 
-const BOT_TOKEN = process.env.DISCORD_TOKEN;
+// Load emojis
+const emojis = JSON.parse(fs.readFileSync("./utils/Emoji.json", "utf8"));
 
-// ------- Fetch Discord User -------
+// Discord API fetcher
 async function fetchDiscordUser(userId) {
-    const res = await fetch(`https://discord.com/api/v10/users/${userId}`, {
+    const url = `https://discord.com/api/v10/users/${userId}`;
+
+    const res = await fetch(url, {
         headers: {
-            Authorization: `Bot ${BOT_TOKEN}`
+            "Authorization": `Bot ${process.env.DISCORD_TOKEN}`,
+            "Content-Type": "application/json"
         }
     });
 
-    if (res.status === 404) return null;
-    return await res.json();
+    const text = await res.text();
+
+    // Debug logging
+    console.log("Discord API Raw Response:");
+    console.log(text);
+
+    try {
+        return JSON.parse(text);
+    } catch (err) {
+        console.error("JSON Parse Error:", err);
+        return {
+            error: true,
+            reason: "Discord returned non-JSON (usually HTML login page)",
+            raw: text
+        };
+    }
 }
 
-// ------- Nitro Detection Logic -------
-function detectNitro(user) {
-    const detection_methods = [];
-
-    const has_avatar_decoration = !!user.avatar_decoration_data;
-    const has_collectibles = !!user.user_profile?.collectibles;
-    const has_display_styles = !!user.user_profile?.bio_styles;
-    const has_clan = !!user.clan;
-    const has_banner = !!user.banner;
-
-    const avatar_hash = user.avatar;
-    const avatar_animated = avatar_hash ? avatar_hash.startsWith("a_") : false;
-
-    if (has_avatar_decoration) detection_methods.push("avatar_decoration");
-    if (has_collectibles) detection_methods.push("collectibles");
-    if (has_display_styles) detection_methods.push("display_name_styles");
-    if (has_clan) detection_methods.push("clan_badge");
-    if (avatar_animated) detection_methods.push("animated_avatar");
-
-    const has_nitro =
-        has_avatar_decoration ||
-        has_collectibles ||
-        has_display_styles ||
-        has_clan ||
-        has_banner ||
-        avatar_animated;
-
-    return {
-        has_nitro,
-        nitro_type: has_nitro ? "Nitro" : "None",
-        nitro_tier: has_nitro ? "Nitro" : "None",
-        premium_type: 0,
-        detection_methods,
-        avatar_animated,
-        has_avatar_decoration,
-        has_collectibles,
-        has_display_styles,
-        has_clan,
-        has_banner
-    };
-}
-
-// ------------------- ROUTES -------------------
-
-app.get("/", (req, res) => {
-    res.json({
-        status: "online",
-        name: "JS Discord Nitro Detection API",
-        version: "1.0.0",
-        endpoints: ["/api/nitro/:id", "/api/user/:id"]
+// Nitro checker (using billing/api)
+async function fetchNitro(token) {
+    const res = await fetch("https://discord.com/api/v9/users/@me/billing/subscriptions", {
+        headers: { "Authorization": token }
     });
-});
 
-app.get("/api/nitro/:id", async (req, res) => {
-    if (!BOT_TOKEN) {
-        return res.status(500).json({ error: "Missing DISCORD_TOKEN" });
+    const text = await res.text();
+    console.log("Billing API Response:", text);
+
+    try {
+        const data = JSON.parse(text);
+
+        if (!Array.isArray(data) || data.length === 0) return "None";
+
+        const months = data[0]?.billing_cycle || 0;
+
+        if (months >= 72) return "Fire72Months";
+        if (months >= 60) return "Ruby60Months";
+        if (months >= 36) return "Emerald36Months";
+        if (months >= 24) return "Diamond24Months";
+        if (months >= 12) return "Platinum12Months";
+        if (months >= 3) return "Silver3Months";
+        if (months >= 1) return "Bronze1Month";
+
+        return "Nitro";
+    } catch {
+        return "None";
+    }
+}
+
+// Badge Parser
+function getBadges(public_flags) {
+    const badgeList = [];
+
+    const flags = {
+        1 << 0: "DiscordStaff",
+        1 << 1: "PartneredServerOwner",
+        1 << 2: "HypeSquadEvents",
+        1 << 3: "BugHunterLevel1",
+        1 << 6: "HypeSquadBravery",
+        1 << 7: "HypeSquadBrilliance",
+        1 << 8: "HypeSquadBalance",
+        1 << 9: "EarlySupporter",
+        1 << 14: "BugHunterLevel2",
+        1 << 17: "ActiveDeveloper",
+        1 << 18: "ModeratorProgramsAlumni",
+        1 << 19: "EarlyVerifiedBotDeveloper"
+    };
+
+    for (const [flag, name] of Object.entries(flags)) {
+        if (public_flags & flag) badgeList.push(name);
     }
 
-    const userId = req.params.id;
+    return badgeList;
+}
 
-    if (!/^\d+$/.test(userId)) {
-        return res.status(400).json({ error: "Invalid user ID" });
+// Convert badge names → emoji
+function convertBadgesToEmojis(badges) {
+    const out = [];
+
+    for (const badge of badges) {
+        if (emojis.Discord_Badges[badge]) {
+            out.push(emojis.Discord_Badges[badge]);
+        }
     }
+
+    return out.join(" ");
+}
+
+// Nitro emoji getter
+function getNitroEmoji(tierName) {
+    if (emojis.Discord_Nitro_Tier[tierName]) {
+        return emojis.Discord_Nitro_Tier[tierName];
+    }
+    return "";
+}
+
+// API Endpoint
+app.post("/discord", async (req, res) => {
+    const { userId, userToken } = req.body;
+
+    if (!userId) return res.json({ error: "userId missing" });
 
     const user = await fetchDiscordUser(userId);
-    if (!user) {
-        return res.status(404).json({ success: false, error: "User not found" });
+
+    if (user.error) return res.json(user);
+
+    const badges = getBadges(user.public_flags || 0);
+    const badgeEmojis = convertBadgesToEmojis(badges);
+
+    let nitroTier = "None";
+    let nitroEmoji = "";
+
+    if (userToken) {
+        nitroTier = await fetchNitro(userToken);
+        nitroEmoji = getNitroEmoji(nitroTier);
     }
 
-    const nitroInfo = detectNitro(user);
-
-    res.json({
-        success: true,
-        user_id: userId,
+    return res.json({
+        id: user.id,
         username: user.username,
         global_name: user.global_name,
-        ...nitroInfo
+        avatar: user.avatar,
+        badges: badgeEmojis,
+        nitro: nitroEmoji
     });
 });
 
-app.get("/api/user/:id", async (req, res) => {
-    const user = await fetchDiscordUser(req.params.id);
-    if (!user) return res.status(404).json({ error: "User not found" });
-
-    res.json({ success: true, user });
+// Start
+app.listen(3000, () => {
+    console.log("API running on port 3000");
 });
-
-// --------------- START SERVER ---------------
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`API running on port ${PORT}`));
