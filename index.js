@@ -1,27 +1,27 @@
 require('dotenv').config()
 const express = require('express')
 const fetch = require('node-fetch')
-const { Client, GatewayIntentBits } = require('discord.js')
 
-const TOKEN = process.env.BOT_TOKEN
-const CACHE_TTL = Number(process.env.CACHE_TTL) || 120
+const BOT_TOKEN = process.env.BOT_TOKEN
+const FIREBASE_URL = process.env.FIREBASE_URL
+const FIREBASE_SECRET = process.env.FIREBASE_SECRET
+const CACHE_TTL = Number(process.env.CACHE_TTL) || 300
+const PORT = process.env.PORT || 3000
 
-if (!TOKEN) process.exit(1)
-
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildPresences
-  ]
-})
-
-client.login(TOKEN).catch(() => process.exit(1))
+if (!BOT_TOKEN) {
+  console.error('Missing BOT_TOKEN')
+  process.exit(1)
+}
+if (!FIREBASE_URL || !FIREBASE_SECRET) {
+  console.error('Missing FIREBASE_URL or FIREBASE_SECRET')
+  process.exit(1)
+}
 
 const app = express()
-const cache = new Map()
+app.use(express.json())
 
-// mapping badges
+const MEM_CACHE = new Map()
+
 const FLAG_MAP = {
   1: "staff",
   2: "partner",
@@ -43,134 +43,194 @@ const FLAG_MAP = {
 }
 
 function decodeFlags(v) {
-  const a = []
   const n = Number(v) || 0
-  for (const k in FLAG_MAP) if (n & Number(k)) a.push(FLAG_MAP[k])
-  return a
+  const out = []
+  for (const k in FLAG_MAP) if (n & Number(k)) out.push(FLAG_MAP[k])
+  return out
 }
 
 function snowflakeToTime(id) {
   try {
-    const t = Number((BigInt(id) >> 22n) + 1420070400000n)
-    return { created_unix: t, created_iso: new Date(t).toISOString() }
+    const ts = Number((BigInt(id) >> 22n) + 1420070400000n)
+    return { createdTimestamp: ts, createdAt: new Date(ts).toISOString() }
   } catch {
-    return { created_unix: null, created_iso: null }
+    return { createdTimestamp: null, createdAt: null }
   }
 }
 
-function avatarUrl(id, hash) {
+function avatarURL(id, hash) {
   if (!hash) return `https://cdn.discordapp.com/embed/avatars/${Number(id) % 5}.png`
   const ext = hash.startsWith('a_') ? 'gif' : 'png'
   return `https://cdn.discordapp.com/avatars/${id}/${hash}.${ext}`
 }
 
-function bannerUrl(id, hash) {
+function bannerURL(id, hash) {
   if (!hash) return null
   return `https://cdn.discordapp.com/banners/${id}/${hash}.png`
 }
 
-async function fetchUser(id) {
-  const r = await fetch(`https://discord.com/api/v10/users/${id}`, {
-    headers: { Authorization: `Bot ${TOKEN}` }
-  })
+async function firebaseGetUser(id) {
+  const url = `${FIREBASE_URL.replace(/\/$/, '')}/users/${id}.json?auth=${FIREBASE_SECRET}`
+  const r = await fetch(url)
   if (!r.ok) return null
+  const json = await r.json()
+  return json
+}
+
+async function firebasePutUser(id, data) {
+  const url = `${FIREBASE_URL.replace(/\/$/, '')}/users/${id}.json?auth=${FIREBASE_SECRET}`
+  const r = await fetch(url, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data)
+  })
+  if (!r.ok) {
+    const text = await r.text().catch(()=>null)
+    throw new Error('Firebase PUT failed: ' + r.status + ' ' + text)
+  }
   return await r.json()
 }
 
-function typeMap(t) {
-  const map = {
-    0: "game",
-    1: "streaming",
-    2: "listening",
-    3: "watching",
-    4: "custom",
-    5: "competing"
+function buildPayloadFromDiscord(userObj, cachedPresence = null) {
+  const times = snowflakeToTime(userObj.id)
+  const flagsRaw = userObj.public_flags ?? userObj.flags ?? 0
+  const badges = decodeFlags(flagsRaw)
+  return {
+    id: userObj.id,
+    username: userObj.username,
+    discriminator: userObj.discriminator,
+    global_name: userObj.global_name || userObj.globalName || null,
+    avatar: userObj.avatar || null,
+    banner: userObj.banner || null,
+    accent_color: userObj.accent_color ?? null,
+    defaultAvatarURL: `https://cdn.discordapp.com/embed/avatars/${Number(userObj.discriminator || 0) % 5}.png`,
+    avatarURL: avatarURL(userObj.id, userObj.avatar),
+    bannerURL: bannerURL(userObj.id, userObj.banner),
+    createdAt: times.createdAt,
+    createdTimestamp: times.createdTimestamp,
+    public_flags: flagsRaw,
+    public_flags_array: badges,
+    nitro: (userObj.premium_type && Number(userObj.premium_type) > 0) ? true : false,
+    updated_at: Date.now(),
+    presence: cachedPresence || null
   }
-  return map[t] || "unknown"
 }
 
-function presenceState(id) {
-  const p = new Set()
-  let pr = null
-  for (const [, g] of client.guilds.cache) {
-    const m = g.members.cache.get(id)
-    if (m && m.presence) {
-      pr = m.presence
-      if (m.presence.clientStatus) {
-        for (const k of Object.keys(m.presence.clientStatus)) p.add(k)
-      }
-      break
+function shallowDiff(a, b) {
+  if (!a || !b) return true
+  const ka = Object.keys(a).sort()
+  const kb = Object.keys(b).sort()
+  if (ka.length !== kb.length) return true
+  for (let k of ka) {
+    const va = a[k]
+    const vb = b[k]
+    if (typeof va === 'object' && typeof vb === 'object') {
+      if (JSON.stringify(va) !== JSON.stringify(vb)) return true
+    } else {
+      if (String(va) !== String(vb)) return true
     }
   }
-  if (!pr) return { status: "offline", activities: [], platforms: [] }
-  const acts = pr.activities.map(a => ({
-    type: typeMap(a.type),
-    name: a.name || null,
-    details: a.details || null,
-    state: a.state || null,
-    application_id: a.applicationId || null,
-    timestamps: a.timestamps || null,
-    emoji: a.emoji ? { name: a.emoji.name, id: a.emoji.id } : null,
-    created_unix: a.createdTimestamp || null
-  }))
-  return { status: pr.status, activities: acts, platforms: Array.from(p) }
+  return false
 }
 
-// ----------- PUBLIC ENDPOINT (NO API KEY) --------------
+async function fetchDiscordUser(id) {
+  const r = await fetch(`https://discord.com/api/v10/users/${id}`, {
+    headers: { Authorization: `Bot ${BOT_TOKEN}` }
+  })
+  return r
+}
 
+// main route
 app.get('/v1/user/:id', async (req, res) => {
   const id = req.params.id
+  const force = req.query.refresh === '1' || req.query.force === '1'
   const now = Date.now()
 
-  const cached = cache.get(id)
-  if (cached && cached.expire > now)
-    return res.json({ success: true, cached: true, cache_ttl: Math.floor((cached.expire - now) / 1000), ...cached.payload })
-
-  const u = await fetchUser(id)
-  if (!u) return res.status(404).json({ success: false, error: "user_not_found" })
-
-  const t = snowflakeToTime(id)
-  const flags = decodeFlags(u.public_flags)
-
-  const profile = {
-    id: u.id,
-    username: u.username,
-    global_name: u.global_name || null,
-    discriminator: u.discriminator,
-    avatar: { hash: u.avatar, url: avatarUrl(u.id, u.avatar) },
-    banner: { hash: u.banner, url: bannerUrl(u.id, u.banner) }
+  // memory cache quick hit
+  const mem = MEM_CACHE.get(id)
+  if (mem && mem.expire > now && !force) {
+    return res.json({ success: true, cached: true, cache_ttl: Math.floor((mem.expire - now) / 1000), ...mem.payload })
   }
 
-  const account = {
-    created_iso: t.created_iso,
-    created_unix: t.created_unix,
-    accent_color: u.accent_color
+  // check firebase
+  let fb = null
+  try {
+    fb = await firebaseGetUser(id)
+  } catch (e) {
+    console.error('firebase get error', e.message)
+    return res.status(500).json({ success: false, error: 'firebase_error' })
   }
 
-  const badges = {
-    raw: u.public_flags,
-    list: flags
+  // if fb exists and fresh and not forcing, return it
+  if (fb && !force) {
+    const age = Date.now() - (fb.updated_at || 0)
+    if (age <= CACHE_TTL * 1000) {
+      MEM_CACHE.set(id, { expire: now + CACHE_TTL * 1000, payload: fb })
+      return res.json({ success: true, cached: true, cache_ttl: Math.floor((CACHE_TTL) - (age/1000)), ...fb })
+    }
   }
 
-  const p = presenceState(u.id)
-  const presence = { status: p.status, activities: p.activities }
-  const platform = { active: p.platforms }
-
-  const connections = {
-    enabled: false,
-    message: "OAuth token required for connections"
+  // attempt fetch from Discord
+  let dresponse
+  try {
+    dresponse = await fetchDiscordUser(id)
+  } catch (e) {
+    console.error('discord fetch err', e.message)
+    if (fb) {
+      MEM_CACHE.set(id, { expire: now + CACHE_TTL * 1000, payload: fb })
+      return res.json({ success: true, cached: true, cache_ttl: Math.floor(CACHE_TTL), ...fb })
+    }
+    return res.status(500).json({ success: false, error: 'discord_fetch_error' })
   }
 
-  const payload = { profile, account, badges, presence, platform, connections }
+  if (dresponse.status === 404) {
+    if (fb) {
+      MEM_CACHE.set(id, { expire: now + CACHE_TTL * 1000, payload: fb })
+      return res.json({ success: true, cached: true, cache_ttl: Math.floor(CACHE_TTL), ...fb })
+    }
+    return res.status(404).json({ success: false, error: 'user_not_found' })
+  }
 
-  cache.set(id, { expire: now + CACHE_TTL * 1000, payload })
+  if (!dresponse.ok) {
+    const text = await dresponse.text().catch(()=>null)
+    console.error('discord non-ok', dresponse.status, text)
+    if (fb) {
+      MEM_CACHE.set(id, { expire: now + CACHE_TTL * 1000, payload: fb })
+      return res.json({ success: true, cached: true, cache_ttl: Math.floor(CACHE_TTL), ...fb })
+    }
+    return res.status(502).json({ success: false, error: 'discord_error', status: dresponse.status })
+  }
 
-  res.json({
-    success: true,
-    cached: false,
-    cache_ttl: CACHE_TTL,
-    ...payload
-  })
+  const userObj = await dresponse.json()
+
+  // try to preserve presence from firebase if exists
+  const cachedPresence = fb && fb.presence ? fb.presence : null
+
+  const fresh = buildPayloadFromDiscord(userObj, cachedPresence)
+
+  // compare and update firebase only if different
+  let needWrite = true
+  if (fb) {
+    needWrite = shallowDiff(fresh, fb)
+  }
+
+  if (needWrite) {
+    try {
+      await firebasePutUser(id, fresh)
+    } catch (e) {
+      console.error('firebase put failed', e.message)
+    }
+  }
+
+  MEM_CACHE.set(id, { expire: now + CACHE_TTL * 1000, payload: fresh })
+
+  return res.json({ success: true, cached: false, cache_ttl: CACHE_TTL, ...fresh })
 })
 
-app.listen(process.env.PORT || 3000)
+app.get('/', (req, res) => {
+  res.json({ status: 'online' })
+})
+
+app.listen(PORT, () => {
+  console.log('API running on port', PORT)
+})
