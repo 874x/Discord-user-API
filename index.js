@@ -1,236 +1,163 @@
-require('dotenv').config()
-const express = require('express')
-const fetch = require('node-fetch')
+import express from "express";
+import dotenv from "dotenv";
+import fetch from "node-fetch";
+import { Client, GatewayIntentBits } from "discord.js";
+import { initializeApp } from "firebase/app";
+import { getDatabase, ref, get, set } from "firebase/database";
 
-const BOT_TOKEN = process.env.BOT_TOKEN
-const FIREBASE_URL = process.env.FIREBASE_URL
-const FIREBASE_SECRET = process.env.FIREBASE_SECRET
-const CACHE_TTL = Number(process.env.CACHE_TTL) || 300
-const PORT = process.env.PORT || 3000
+// ----------------------
+// LOAD ENV VARIABLES
+// ----------------------
+dotenv.config();
 
-if (!BOT_TOKEN) {
-  console.error('Missing BOT_TOKEN')
-  process.exit(1)
+const TOKEN = process.env.BOT_TOKEN;
+const FIREBASE_URL = process.env.FIREBASE_URL;
+const FIREBASE_SECRET = process.env.FIREBASE_SECRET;
+const CACHE_TTL = parseInt(process.env.CACHE_TTL || "300000"); // 5 min default
+
+if (!TOKEN) {
+    console.error("❌ BOT_TOKEN missing");
+    process.exit(1);
 }
 if (!FIREBASE_URL || !FIREBASE_SECRET) {
-  console.error('Missing FIREBASE_URL or FIREBASE_SECRET')
-  process.exit(1)
+    console.error("❌ Firebase env missing");
+    process.exit(1);
 }
 
-const app = express()
-app.use(express.json())
+// ----------------------
+// FIREBASE INIT
+// ----------------------
+const firebaseConfig = {
+    databaseURL: FIREBASE_URL,
+    apiKey: FIREBASE_SECRET
+};
 
-const MEM_CACHE = new Map()
+const firebase = initializeApp(firebaseConfig);
+const db = getDatabase(firebase);
 
-const FLAG_MAP = {
-  1: "staff",
-  2: "partner",
-  4: "hypesquad",
-  8: "bug_hunter_level_1",
-  16: "green_dot",
-  64: "hypesquad_bravery",
-  128: "hypesquad_brilliance",
-  256: "hypesquad_balance",
-  512: "early_supporter",
-  1024: "team_user",
-  2048: "bug_hunter_level_2",
-  4096: "verified_bot",
-  8192: "verified_developer",
-  16384: "certified_moderator",
-  65536: "bot_http_interactions",
-  131072: "active_developer",
-  4194304: "nitro"
+// ----------------------
+// DISCORD CLIENT
+// ----------------------
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMembers
+    ]
+});
+
+client.login(TOKEN).catch(err => {
+    console.error("Login error:", err);
+    process.exit(1);
+});
+
+// ----------------------
+// EXPRESS SERVER
+// ----------------------
+const app = express();
+
+// convert bitfield into badges
+function getBadges(flags) {
+    const map = {
+        1 << 0: "discord_staff",
+        1 << 1: "discord_partner",
+        1 << 2: "hypesquad_events",
+        1 << 3: "bug_hunter_level_1",
+        1 << 6: "house_bravery",
+        1 << 7: "house_brilliance",
+        1 << 8: "house_balance",
+        1 << 9: "early_supporter",
+        1 << 14: "bug_hunter_level_2",
+        1 << 17: "verified_bot",
+        1 << 18: "verified_developer"
+    };
+
+    const badges = [];
+    Object.keys(map).forEach(bit => {
+        if (flags & bit) badges.push(map[bit]);
+    });
+
+    return badges;
 }
 
-function decodeFlags(v) {
-  const n = Number(v) || 0
-  const out = []
-  for (const k in FLAG_MAP) if (n & Number(k)) out.push(FLAG_MAP[k])
-  return out
+// get nitro type from premiumType
+function getNitro(type) {
+    return {
+        0: null,
+        1: "nitro_classic",
+        2: "nitro_boost",
+        3: "nitro_basic"
+    }[type] || null;
 }
 
-function snowflakeToTime(id) {
-  try {
-    const ts = Number((BigInt(id) >> 22n) + 1420070400000n)
-    return { createdTimestamp: ts, createdAt: new Date(ts).toISOString() }
-  } catch {
-    return { createdTimestamp: null, createdAt: null }
-  }
+async function fetchUserRaw(id) {
+    const user = await client.users.fetch(id).catch(() => null);
+    return user;
 }
 
-function avatarURL(id, hash) {
-  if (!hash) return `https://cdn.discordapp.com/embed/avatars/${Number(id) % 5}.png`
-  const ext = hash.startsWith('a_') ? 'gif' : 'png'
-  return `https://cdn.discordapp.com/avatars/${id}/${hash}.${ext}`
-}
+// ----------------------
+// MAIN ENDPOINT — EXACT LIKE JAPI
+// ----------------------
+app.get("/v1/user/:id", async (req, res) => {
+    const id = req.params.id;
 
-function bannerURL(id, hash) {
-  if (!hash) return null
-  return `https://cdn.discordapp.com/banners/${id}/${hash}.png`
-}
+    // Firebase REF
+    const cacheRef = ref(db, `users/${id}`);
 
-async function firebaseGetUser(id) {
-  const url = `${FIREBASE_URL.replace(/\/$/, '')}/users/${id}.json?auth=${FIREBASE_SECRET}`
-  const r = await fetch(url)
-  if (!r.ok) return null
-  const json = await r.json()
-  return json
-}
+    // Check cache
+    const snap = await get(cacheRef);
+    const now = Date.now();
 
-async function firebasePutUser(id, data) {
-  const url = `${FIREBASE_URL.replace(/\/$/, '')}/users/${id}.json?auth=${FIREBASE_SECRET}`
-  const r = await fetch(url, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data)
-  })
-  if (!r.ok) {
-    const text = await r.text().catch(()=>null)
-    throw new Error('Firebase PUT failed: ' + r.status + ' ' + text)
-  }
-  return await r.json()
-}
+    if (snap.exists()) {
+        const cached = snap.val();
 
-function buildPayloadFromDiscord(userObj, cachedPresence = null) {
-  const times = snowflakeToTime(userObj.id)
-  const flagsRaw = userObj.public_flags ?? userObj.flags ?? 0
-  const badges = decodeFlags(flagsRaw)
-  return {
-    id: userObj.id,
-    username: userObj.username,
-    discriminator: userObj.discriminator,
-    global_name: userObj.global_name || userObj.globalName || null,
-    avatar: userObj.avatar || null,
-    banner: userObj.banner || null,
-    accent_color: userObj.accent_color ?? null,
-    defaultAvatarURL: `https://cdn.discordapp.com/embed/avatars/${Number(userObj.discriminator || 0) % 5}.png`,
-    avatarURL: avatarURL(userObj.id, userObj.avatar),
-    bannerURL: bannerURL(userObj.id, userObj.banner),
-    createdAt: times.createdAt,
-    createdTimestamp: times.createdTimestamp,
-    public_flags: flagsRaw,
-    public_flags_array: badges,
-    nitro: (userObj.premium_type && Number(userObj.premium_type) > 0) ? true : false,
-    updated_at: Date.now(),
-    presence: cachedPresence || null
-  }
-}
-
-function shallowDiff(a, b) {
-  if (!a || !b) return true
-  const ka = Object.keys(a).sort()
-  const kb = Object.keys(b).sort()
-  if (ka.length !== kb.length) return true
-  for (let k of ka) {
-    const va = a[k]
-    const vb = b[k]
-    if (typeof va === 'object' && typeof vb === 'object') {
-      if (JSON.stringify(va) !== JSON.stringify(vb)) return true
-    } else {
-      if (String(va) !== String(vb)) return true
+        if (now - cached.cached_at < CACHE_TTL) {
+            return res.json({
+                success: true,
+                cached: true,
+                data: cached.data
+            });
+        }
     }
-  }
-  return false
-}
 
-async function fetchDiscordUser(id) {
-  const r = await fetch(`https://discord.com/api/v10/users/${id}`, {
-    headers: { Authorization: `Bot ${BOT_TOKEN}` }
-  })
-  return r
-}
+    // Fetch user from YOUR BOT, not Discord API
+    const u = await fetchUserRaw(id);
 
-// main route
-app.get('/v1/user/:id', async (req, res) => {
-  const id = req.params.id
-  const force = req.query.refresh === '1' || req.query.force === '1'
-  const now = Date.now()
-
-  // memory cache quick hit
-  const mem = MEM_CACHE.get(id)
-  if (mem && mem.expire > now && !force) {
-    return res.json({ success: true, cached: true, cache_ttl: Math.floor((mem.expire - now) / 1000), ...mem.payload })
-  }
-
-  // check firebase
-  let fb = null
-  try {
-    fb = await firebaseGetUser(id)
-  } catch (e) {
-    console.error('firebase get error', e.message)
-    return res.status(500).json({ success: false, error: 'firebase_error' })
-  }
-
-  // if fb exists and fresh and not forcing, return it
-  if (fb && !force) {
-    const age = Date.now() - (fb.updated_at || 0)
-    if (age <= CACHE_TTL * 1000) {
-      MEM_CACHE.set(id, { expire: now + CACHE_TTL * 1000, payload: fb })
-      return res.json({ success: true, cached: true, cache_ttl: Math.floor((CACHE_TTL) - (age/1000)), ...fb })
+    if (!u) {
+        return res.json({ success: false, error: "user_not_found" });
     }
-  }
 
-  // attempt fetch from Discord
-  let dresponse
-  try {
-    dresponse = await fetchDiscordUser(id)
-  } catch (e) {
-    console.error('discord fetch err', e.message)
-    if (fb) {
-      MEM_CACHE.set(id, { expire: now + CACHE_TTL * 1000, payload: fb })
-      return res.json({ success: true, cached: true, cache_ttl: Math.floor(CACHE_TTL), ...fb })
-    }
-    return res.status(500).json({ success: false, error: 'discord_fetch_error' })
-  }
+    const badges = getBadges(u.flags?.bitfield || 0);
+    const nitro = getNitro(u.premiumType);
 
-  if (dresponse.status === 404) {
-    if (fb) {
-      MEM_CACHE.set(id, { expire: now + CACHE_TTL * 1000, payload: fb })
-      return res.json({ success: true, cached: true, cache_ttl: Math.floor(CACHE_TTL), ...fb })
-    }
-    return res.status(404).json({ success: false, error: 'user_not_found' })
-  }
+    const userData = {
+        id: u.id,
+        username: u.username,
+        global_name: u.globalName ?? null,
+        discriminator: u.discriminator,
+        avatar: u.displayAvatarURL({ extension: "png", size: 4096 }),
+        banner: u.bannerURL({ extension: "png", size: 4096 }),
+        banner_color: u.hexAccentColor,
+        created_timestamp: u.createdTimestamp,
+        created_date: new Date(u.createdTimestamp).toISOString(),
+        public_flags: badges,
+        nitro: nitro
+    };
 
-  if (!dresponse.ok) {
-    const text = await dresponse.text().catch(()=>null)
-    console.error('discord non-ok', dresponse.status, text)
-    if (fb) {
-      MEM_CACHE.set(id, { expire: now + CACHE_TTL * 1000, payload: fb })
-      return res.json({ success: true, cached: true, cache_ttl: Math.floor(CACHE_TTL), ...fb })
-    }
-    return res.status(502).json({ success: false, error: 'discord_error', status: dresponse.status })
-  }
+    // Save to cache
+    await set(cacheRef, {
+        cached_at: now,
+        data: userData
+    });
 
-  const userObj = await dresponse.json()
+    return res.json({
+        success: true,
+        cached: false,
+        data: userData
+    });
+});
 
-  // try to preserve presence from firebase if exists
-  const cachedPresence = fb && fb.presence ? fb.presence : null
-
-  const fresh = buildPayloadFromDiscord(userObj, cachedPresence)
-
-  // compare and update firebase only if different
-  let needWrite = true
-  if (fb) {
-    needWrite = shallowDiff(fresh, fb)
-  }
-
-  if (needWrite) {
-    try {
-      await firebasePutUser(id, fresh)
-    } catch (e) {
-      console.error('firebase put failed', e.message)
-    }
-  }
-
-  MEM_CACHE.set(id, { expire: now + CACHE_TTL * 1000, payload: fresh })
-
-  return res.json({ success: true, cached: false, cache_ttl: CACHE_TTL, ...fresh })
-})
-
-app.get('/', (req, res) => {
-  res.json({ status: 'online' })
-})
-
-app.listen(PORT, () => {
-  console.log('API running on port', PORT)
-})
+// ----------------------
+// START SERVER
+// ----------------------
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("API running on port " + PORT));
